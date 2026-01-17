@@ -115,10 +115,10 @@ def init_db():
 
 
 # ==============================================================================
-#                           TELEGRAM FUNCTION (DEBUGGED)
+#                           TELEGRAM FUNCTION
 # ==============================================================================
 def send_telegram_message(message, test_mode=False):
-    """Sends a message to one or multiple Telegram Chats with Error Reporting."""
+    """Sends a message to one or multiple Telegram Chats."""
     if "telegram" not in st.secrets:
         if test_mode: st.error("Secrets missing! Check secrets.toml for [telegram] section.")
         return
@@ -127,9 +127,9 @@ def send_telegram_message(message, test_mode=False):
         bot_token = st.secrets["telegram"]["bot_token"]
         chat_ids = st.secrets["telegram"]["chat_id"]
 
-        # Ensure chat_ids is a list
+        # Ensure chat_ids is a list (handles single string case)
         if not isinstance(chat_ids, list):
-            chat_ids = [chat_ids]
+            chat_ids = [str(chat_ids)]
 
         success_count = 0
         for cid in chat_ids:
@@ -141,12 +141,10 @@ def send_telegram_message(message, test_mode=False):
             }
             response = requests.post(url, json=payload)
             
-            # CHECK FOR ERRORS
             if response.status_code == 200:
                 success_count += 1
             else:
-                if test_mode:
-                    st.error(f"Failed for ID {cid}: {response.text}")
+                if test_mode: st.error(f"Failed for ID {cid}: {response.text}")
                 print(f"Telegram Error: {response.text}")
 
         if test_mode and success_count > 0:
@@ -194,7 +192,6 @@ def get_filtered_trades_advanced(f_status, f_zone, f_strat, f_pct):
     df = get_trades_df()
     if df.empty: return df
 
-    # Basic Filtering
     if f_status != "All":
         df = df[df['status'] == f_status]
     if f_zone != "All":
@@ -226,7 +223,6 @@ def get_filtered_trades_advanced(f_status, f_zone, f_strat, f_pct):
 
     df[['diff_pct', 'Alert']] = df.apply(lambda row: pd.Series(calc_alert(row)), axis=1)
 
-    # Filter by % Diff if requested
     if f_pct != "All":
         limit = float(f_pct)
         df = df[df['diff_pct'] <= limit]
@@ -428,7 +424,7 @@ with st.sidebar:
     nav_option = st.radio("Main Navigation", ["Dashboard", "Live Trades", "Past Trades", "Portfolio Watch"], label_visibility="collapsed")
     st.markdown("---")
     
-    # --- TEST TELEGRAM BUTTON ---
+    # --- TEST BUTTON ---
     if st.button("📢 Test Telegram"):
         send_telegram_message("✅ *Test Message from Stock Manager!* \nIf you see this, your bot is working.", test_mode=True)
     
