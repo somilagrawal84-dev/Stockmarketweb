@@ -85,6 +85,7 @@ def get_col_letter(col_idx):
 
 def init_db():
     sh = get_db()
+    
     # 1. TRADES TAB
     try:
         ws_trades = sh.worksheet("Trades")
@@ -93,11 +94,16 @@ def init_db():
         ws_trades.append_row([
             "id", "stock_name", "cmp", "entry", "stop_loss", "target",
             "remark", "trade_type", "dv_analysis", "trade_zone",
-            "trigger_date", "exit_date", "status"
+            "trigger_date", "exit_date", "status", "last_alert"
         ])
+    
+    # Ensure "last_alert" column exists (Migration logic)
     headers = ws_trades.row_values(1)
     if "status" not in headers:
         ws_trades.update_cell(1, len(headers) + 1, "status")
+        headers = ws_trades.row_values(1)
+    if "last_alert" not in headers:
+        ws_trades.update_cell(1, len(headers) + 1, "last_alert")
 
     # 2. PORTFOLIO TAB
     try:
@@ -118,41 +124,22 @@ def init_db():
 #                           TELEGRAM FUNCTION
 # ==============================================================================
 def send_telegram_message(message, test_mode=False):
-    """Sends a message to one or multiple Telegram Chats."""
     if "telegram" not in st.secrets:
-        if test_mode: st.error("Secrets missing! Check secrets.toml for [telegram] section.")
+        if test_mode: st.error("Secrets missing!")
         return
 
     try:
         bot_token = st.secrets["telegram"]["bot_token"]
         chat_ids = st.secrets["telegram"]["chat_id"]
+        if not isinstance(chat_ids, list): chat_ids = [str(chat_ids)]
 
-        # Ensure chat_ids is a list (handles single string case)
-        if not isinstance(chat_ids, list):
-            chat_ids = [str(chat_ids)]
-
-        success_count = 0
         for cid in chat_ids:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            payload = {
-                "chat_id": cid,
-                "text": message,
-                "parse_mode": "Markdown"
-            }
-            response = requests.post(url, json=payload)
-            
-            if response.status_code == 200:
-                success_count += 1
-            else:
-                if test_mode: st.error(f"Failed for ID {cid}: {response.text}")
-                print(f"Telegram Error: {response.text}")
-
-        if test_mode and success_count > 0:
-            st.success(f"Sent successfully to {success_count} chats!")
+            payload = {"chat_id": cid, "text": message, "parse_mode": "Markdown"}
+            requests.post(url, json=payload)
 
     except Exception as e:
-        if test_mode: st.error(f"Code Error: {e}")
-        print(f"Failed to send Telegram message: {e}")
+        print(f"Telegram Error: {e}")
 
 
 # ==============================================================================
@@ -170,12 +157,29 @@ def get_trades_df():
         for c in cols:
             df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0.0)
 
-        if 'status' not in df.columns:
-            df['status'] = "Pending"
-        else:
-            df['status'] = df['status'].replace(r'^\s*$', 'Pending', regex=True)
-            df['status'] = df['status'].fillna('Pending')
+        if 'status' not in df.columns: df['status'] = "Pending"
+        if 'last_alert' not in df.columns: df['last_alert'] = ""
+        
+        df['status'] = df['status'].replace(r'^\s*$', 'Pending', regex=True).fillna('Pending')
+        df['last_alert'] = df['last_alert'].fillna("")
+        
     return df
+
+
+def update_last_alert_in_db(trade_id, alert_msg):
+    try:
+        sh = get_db()
+        ws = sh.worksheet("Trades")
+        cell = ws.find(str(trade_id), in_column=1)
+        if cell:
+            headers = ws.row_values(1)
+            try:
+                col_idx = headers.index("last_alert") + 1
+                ws.update_cell(cell.row, col_idx, alert_msg)
+            except ValueError:
+                pass 
+    except Exception as e:
+        print(f"DB Update Error: {e}")
 
 
 def get_trendlyne_map():
@@ -192,56 +196,51 @@ def get_filtered_trades_advanced(f_status, f_zone, f_strat, f_pct):
     df = get_trades_df()
     if df.empty: return df
 
-    if f_status != "All":
-        df = df[df['status'] == f_status]
-    if f_zone != "All":
-        df = df[df['trade_zone'] == f_zone]
-    if f_strat != "All":
-        df = df[df['trade_type'] == f_strat]
+    if f_status != "All": df = df[df['status'] == f_status]
+    if f_zone != "All": df = df[df['trade_zone'] == f_zone]
+    if f_strat != "All": df = df[df['trade_type'] == f_strat]
 
     if df.empty: return df
 
-    # ALERT CALCULATION LOGIC
     def calc_alert(row):
-        # PRIORITY 1: Check if Active
-        if row['status'] == 'Active':
-            return 0.0, "Trade is Active"
-
-        # PRIORITY 2: Check Proximity (Percentage)
-        if row['entry'] == 0: return 100, ""
+        # PRIORITY 1: Active
+        if row['status'] == 'Active': return 0.0, "Trade is Active"
         
+        # PRIORITY 2: Proximity
+        if row['entry'] == 0: return 100, ""
         diff = abs(row['cmp'] - row['entry'])
         pct = (diff / row['entry']) * 100
         
-        alert_msg = ""
-        if pct <= 0.5:
-            alert_msg = "Within 0.5% Range"
-        elif pct <= 1.0:
-            alert_msg = "Within 1% Range"
-            
-        return pct, alert_msg
+        if pct <= 0.5: return pct, "Within 0.5% Range"
+        elif pct <= 1.0: return pct, "Within 1% Range"
+        return pct, ""
 
     df[['diff_pct', 'Alert']] = df.apply(lambda row: pd.Series(calc_alert(row)), axis=1)
 
+    # --- UPDATED RANGE FILTER LOGIC ---
     if f_pct != "All":
-        limit = float(f_pct)
-        df = df[df['diff_pct'] <= limit]
+        if f_pct == "0 - 0.5%":
+            df = df[df['diff_pct'] <= 0.5]
+        elif f_pct == "0.5% - 1%":
+            df = df[(df['diff_pct'] > 0.5) & (df['diff_pct'] <= 1.0)]
+        elif f_pct == "1% - 1.5%":
+            df = df[(df['diff_pct'] > 1.0) & (df['diff_pct'] <= 1.5)]
+        elif f_pct == "1.5% - 2%":
+            df = df[(df['diff_pct'] > 1.5) & (df['diff_pct'] <= 2.0)]
+        elif f_pct == "2% - 2.5%":
+            df = df[(df['diff_pct'] > 2.0) & (df['diff_pct'] <= 2.5)]
+        elif f_pct == "2.5% - 3%":
+            df = df[(df['diff_pct'] > 2.5) & (df['diff_pct'] <= 3.0)]
 
     link_map = get_trendlyne_map()
-    def match_link(stock_name):
-        clean_name = str(stock_name).replace('.NS', '').replace('.BO', '').strip().upper()
-        return link_map.get(clean_name, None)
-
-    df['Trendlyne'] = df['stock_name'].apply(match_link)
+    df['Trendlyne'] = df['stock_name'].apply(lambda x: link_map.get(str(x).replace('.NS','').strip().upper()))
     return df
 
 
 def get_next_id(df):
     if df.empty or 'id' not in df.columns: return 1
-    try:
-        return int(pd.to_numeric(df['id'], errors='coerce').max()) + 1
-    except:
-        return 1
+    try: return int(pd.to_numeric(df['id'], errors='coerce').max()) + 1
+    except: return 1
 
 
 def add_trade(data):
@@ -251,17 +250,18 @@ def add_trade(data):
     new_id = get_next_id(df)
     clean_stock = data['stock'].replace('.NS', '').replace('.BO', '')
     link = f"https://in.tradingview.com/chart/?symbol=NSE:{clean_stock}"
+    
     headers = ws.row_values(1)
+    
     row_data = {
         "id": new_id, "stock_name": data['stock'], "cmp": data['cmp'],
         "entry": data['entry'], "stop_loss": data['sl'], "target": data['tgt'],
         "remark": data['remark'], "trade_type": data['type'],
         "dv_analysis": link, "trade_zone": data['zone'],
-        "trigger_date": "", "exit_date": "", "status": "Pending"
+        "trigger_date": "", "exit_date": "", "status": "Pending", "last_alert": ""
     }
-    final_row = []
-    for h in headers:
-        final_row.append(row_data.get(h, ""))
+    
+    final_row = [row_data.get(h, "") for h in headers]
     ws.append_row(final_row)
 
 
@@ -298,18 +298,27 @@ def update_prices_logic():
     if not all_values: return 0, 0, 0
     headers = all_values[0]
     rows = all_values[1:]
+    
     try:
         col_map = {h: i for i, h in enumerate(headers)}
-        idx_stock, idx_cmp = col_map["stock_name"], col_map["cmp"]
-        idx_entry, idx_sl = col_map["entry"], col_map["stop_loss"]
-        idx_tgt, idx_trig = col_map["target"], col_map["trigger_date"]
-        idx_exit, idx_zone, idx_status = col_map["exit_date"], col_map["trade_zone"], col_map["status"]
+        idx_stock = col_map["stock_name"]
+        idx_cmp = col_map["cmp"]
+        idx_entry = col_map["entry"]
+        idx_sl = col_map["stop_loss"]
+        idx_tgt = col_map["target"]
+        idx_trig = col_map["trigger_date"]
+        idx_exit = col_map["exit_date"]
+        idx_zone = col_map["trade_zone"]
+        idx_status = col_map["status"]
     except KeyError: return 0, 0, 0
+    
     updates = []
     count = 0; new_triggers = 0; new_exits = 0
+    
     def to_float(val):
         try: return float(str(val).replace(',', '').strip())
         except: return 0.0
+
     for i, row in enumerate(rows):
         row_num = i + 2
         name = row[idx_stock]
@@ -318,22 +327,27 @@ def update_prices_logic():
             current_status = row[idx_status].strip() if len(row) > idx_status else "Pending"
             if not current_status: current_status = "Pending"
             if current_status in ["Target-Hit", "SL-Hit"]: continue
+
             tkr = name + ".NS" if not name.endswith((".NS", ".BO")) else name
             data = yf.Ticker(tkr).history(period="1d")
             if data.empty: continue
             cmp_val = round(data['Close'].iloc[-1], 2)
+            
             entry = to_float(row[idx_entry])
             sl, tgt = to_float(row[idx_sl]), to_float(row[idx_tgt])
             zone = row[idx_zone].strip()
-            new_status, new_trig, new_exit = current_status, row[idx_trig], row[idx_exit]
+            
+            new_status = current_status
+            new_trig = row[idx_trig]
+            new_exit = row[idx_exit]
             changed = False
 
+            # Logic
             if new_status == "Pending":
                 triggered = False
-                # DEMAND: Trigger if Price drops DOWN to Entry (Buy Dip)
                 if zone == "DEMAND" and cmp_val <= entry and entry > 0: triggered = True
-                # SUPPLY: Trigger if Price rises UP to Entry (Sell Rally)
                 elif zone == "SUPPLY" and cmp_val >= entry and entry > 0: triggered = True
+                
                 if triggered:
                     new_status = "Active"
                     new_trig = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -350,22 +364,22 @@ def update_prices_logic():
                 if hit:
                     new_exit = datetime.now().strftime("%Y-%m-%d %H:%M"); new_exits += 1; changed = True
 
+            # Prepare Batch
             col_cmp_letter = get_col_letter(idx_cmp)
             updates.append({'range': f'{col_cmp_letter}{row_num}', 'values': [[cmp_val]]})
+            
             if changed or row[idx_status].strip() == "":
                 updates.append({'range': f'{get_col_letter(idx_status)}{row_num}', 'values': [[new_status]]})
+            
             if changed:
                 updates.append({'range': f'{get_col_letter(idx_trig)}{row_num}', 'values': [[new_trig]]})
                 updates.append({'range': f'{get_col_letter(idx_exit)}{row_num}', 'values': [[new_exit]]})
+                
             count += 1
         except Exception: pass
+        
     if updates: ws.batch_update(updates)
     return count, new_triggers, new_exits
-
-def get_stats():
-    df = get_trades_df()
-    if df.empty: return 0, 0, 0
-    return len(df), len(df[df['trade_zone'] == 'DEMAND']), len(df[df['trade_zone'] == 'SUPPLY'])
 
 
 # ==============================================================================
@@ -402,11 +416,8 @@ def delete_portfolio_stock(stock_name):
 @st.dialog("🚨 Market Alerts")
 def show_alert_popup(alert_df):
     st.warning("Updates Detected:")
-    
-    # Display simplified table in popup
     display_df = alert_df[['stock_name', 'Alert', 'trade_type', 'cmp']].reset_index(drop=True)
     st.dataframe(display_df, use_container_width=True)
-    
     st.write("---")
     if st.button("OK, Dismiss", type="primary"):
         st.session_state.show_popup = False
@@ -426,7 +437,7 @@ with st.sidebar:
     
     # --- TEST BUTTON ---
     if st.button("📢 Test Telegram"):
-        send_telegram_message("✅ *Test Message from Stock Manager!* \nIf you see this, your bot is working.", test_mode=True)
+        send_telegram_message("✅ *Test Message!* Bot is working.", test_mode=True)
     
     st.markdown("---")
     is_dark = st.toggle("🌙 Dark Mode", value=False)
@@ -469,7 +480,11 @@ if nav_option == "Dashboard":
     with f1: f_status = st.selectbox("Status", ["All", "Pending", "Active", "Target-Hit", "SL-Hit"], index=0)
     with f2: f_zone = st.selectbox("Zone", ["All", "DEMAND", "SUPPLY"], index=0)
     with f3: f_strat = st.selectbox("Strategy", ["All", "QIT", "MIT", "WIT", "DIT"], index=0)
-    with f4: f_pct = st.selectbox("% CMP Diff", ["All", "0.5", "1", "1.5", "2"], index=0)
+    
+    # --- UPDATED DROPDOWN OPTIONS ---
+    pct_options = ["All", "0 - 0.5%", "0.5% - 1%", "1% - 1.5%", "1.5% - 2%", "2% - 2.5%", "2.5% - 3%"]
+    with f4: f_pct = st.selectbox("% CMP Diff", pct_options, index=0)
+    
     st.markdown("---")
 
     c1, c2 = st.columns(2)
@@ -512,35 +527,26 @@ if nav_option == "Dashboard":
     df = get_filtered_trades_advanced(f_status, f_zone, f_strat, f_pct)
 
     if not df.empty:
-        # --- POPUP & TELEGRAM LOGIC ---
-        current_alerts = df[df['Alert'] != ""]
+        # --- ROBUST ALERT SYSTEM ---
         new_popup_alerts = []
         
-        for idx, row in current_alerts.iterrows():
-            s_name = row['stock_name']
-            curr_alert_msg = row['Alert']
-            prev_msg = st.session_state.previous_alerts.get(s_name, "")
+        for idx, row in df.iterrows():
+            curr_alert = row['Alert']
+            last_alert = row['last_alert']
             
-            # TRIGGER IF ALERT TEXT CHANGES
-            if curr_alert_msg != prev_msg:
+            if curr_alert != "" and curr_alert != last_alert:
                 new_popup_alerts.append(row)
-                st.session_state.previous_alerts[s_name] = curr_alert_msg
                 
-                # --- SEND TELEGRAM MESSAGE (MULTIPLE) ---
                 tele_msg = (
                     f"🚀 *STOCK ALERT: {row['stock_name']}*\n"
-                    f"⚠️ Status: {curr_alert_msg}\n"
+                    f"⚠️ Status: {curr_alert}\n"
                     f"💰 CMP: {row['cmp']}\n"
                     f"🎯 Entry: {row['entry']}\n"
                     f"📊 Type: {row['trade_type']}"
                 )
                 send_telegram_message(tele_msg)
-        
-        # Cleanup
-        current_stock_names = set(current_alerts['stock_name'])
-        for s_name in list(st.session_state.previous_alerts.keys()):
-            if s_name not in current_stock_names:
-                st.session_state.previous_alerts[s_name] = ""
+                
+                update_last_alert_in_db(row['id'], curr_alert)
 
         if new_popup_alerts:
             st.session_state.popup_data = pd.DataFrame(new_popup_alerts)
@@ -551,12 +557,9 @@ if nav_option == "Dashboard":
 
         def highlight_alerts(row):
             styles = [''] * len(row)
-            if row['Alert'] == "Trade is Active":
-                return ['background-color: #4caf50; color: white; font-weight: bold'] * len(row)
-            elif row['Alert'] == "Within 0.5% Range":
-                return ['background-color: #ffeb3b; color: black'] * len(row)
-            elif row['Alert'] == "Within 1% Range":
-                return ['background-color: #90caf9; color: black'] * len(row)
+            if row['Alert'] == "Trade is Active": return ['background-color: #4caf50; color: white; font-weight: bold'] * len(row)
+            elif row['Alert'] == "Within 0.5% Range": return ['background-color: #ffeb3b; color: black'] * len(row)
+            elif row['Alert'] == "Within 1% Range": return ['background-color: #90caf9; color: black'] * len(row)
             return styles
 
         st.dataframe(
