@@ -1,4 +1,6 @@
-openpyxl
 streamlit
-pandas
+gspread
+google-auth
 yfinance
+pandas
+
