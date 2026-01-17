@@ -115,21 +115,23 @@ def init_db():
 
 
 # ==============================================================================
-#                           TELEGRAM FUNCTION (UPDATED)
+#                           TELEGRAM FUNCTION (DEBUGGED)
 # ==============================================================================
-def send_telegram_message(message):
-    """Sends a message to one or multiple Telegram Chats."""
-    try:
-        if "telegram" not in st.secrets:
-            return
+def send_telegram_message(message, test_mode=False):
+    """Sends a message to one or multiple Telegram Chats with Error Reporting."""
+    if "telegram" not in st.secrets:
+        if test_mode: st.error("Secrets missing! Check secrets.toml for [telegram] section.")
+        return
 
+    try:
         bot_token = st.secrets["telegram"]["bot_token"]
         chat_ids = st.secrets["telegram"]["chat_id"]
 
-        # Ensure chat_ids is a list, even if only one ID is provided
+        # Ensure chat_ids is a list
         if not isinstance(chat_ids, list):
             chat_ids = [chat_ids]
 
+        success_count = 0
         for cid in chat_ids:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
             payload = {
@@ -137,9 +139,21 @@ def send_telegram_message(message):
                 "text": message,
                 "parse_mode": "Markdown"
             }
-            requests.post(url, json=payload)
+            response = requests.post(url, json=payload)
             
+            # CHECK FOR ERRORS
+            if response.status_code == 200:
+                success_count += 1
+            else:
+                if test_mode:
+                    st.error(f"Failed for ID {cid}: {response.text}")
+                print(f"Telegram Error: {response.text}")
+
+        if test_mode and success_count > 0:
+            st.success(f"Sent successfully to {success_count} chats!")
+
     except Exception as e:
+        if test_mode: st.error(f"Code Error: {e}")
         print(f"Failed to send Telegram message: {e}")
 
 
@@ -412,6 +426,12 @@ if 'last_refresh' not in st.session_state: st.session_state.last_refresh = time.
 with st.sidebar:
     st.markdown("### 🧭 Navigation")
     nav_option = st.radio("Main Navigation", ["Dashboard", "Live Trades", "Past Trades", "Portfolio Watch"], label_visibility="collapsed")
+    st.markdown("---")
+    
+    # --- TEST TELEGRAM BUTTON ---
+    if st.button("📢 Test Telegram"):
+        send_telegram_message("✅ *Test Message from Stock Manager!* \nIf you see this, your bot is working.", test_mode=True)
+    
     st.markdown("---")
     is_dark = st.toggle("🌙 Dark Mode", value=False)
     st.markdown(apply_theme(is_dark), unsafe_allow_html=True)
