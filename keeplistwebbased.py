@@ -1,20 +1,30 @@
 import streamlit as st
-import sqlite3
+import gspread
+from google.oauth2.service_account import Credentials
 import yfinance as yf
 import pandas as pd
 from datetime import datetime
 import time
-import os
 
 # --- CONFIGURATION ---
-DB_NAME = "stocks.db"
+SHEET_NAME = "Pro Stock Manager DB"
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
 st.set_page_config(page_title="Pro Stock Manager", layout="wide", page_icon="🚀")
 
 # ==============================================================================
-#                           THEME ENGINE
+#                           THEME & SESSION
 # ==============================================================================
 if 'dark_mode' not in st.session_state: st.session_state.dark_mode = False
+if 'edit_data' not in st.session_state: st.session_state.edit_data = None
+
+# TRACK PREVIOUS ALERTS TO PREVENT REPEATED POPUPS
+if 'previous_alerts' not in st.session_state: st.session_state.previous_alerts = {}
+if 'show_popup' not in st.session_state: st.session_state.show_popup = False
+if 'popup_data' not in st.session_state: st.session_state.popup_data = pd.DataFrame()
 
 
 def apply_theme(is_dark):
@@ -23,17 +33,12 @@ def apply_theme(is_dark):
         <style>
         .stApp { background-color: #0e1117; color: #e0e0e0; }
         section[data-testid="stSidebar"] { background-color: #161b22; border-right: 1px solid #30363d; }
-        .css-1r6slb0, .stDataFrame, .stForm, div[data-testid="stExpander"] { 
-            background-color: #1f2937 !important; border: 1px solid #374151; border-radius: 8px;
-        }
         .stTextInput input, .stNumberInput input, .stDateInput input, .stSelectbox div[data-baseweb="select"] > div {
             background-color: #374151 !important; color: #ffffff !important; border-color: #4b5563 !important;
         }
-        ul[data-testid="stSelectboxVirtualDropdown"] { background-color: #374151 !important; }
         h1, h2, h3, p, label, .stMarkdown { color: #e0e0e0 !important; }
         div[data-testid="stMetricLabel"] { color: #9ca3af !important; }
         div[data-testid="stMetricValue"] { color: #ffffff !important; }
-        div[data-testid="stDataFrame"] { background-color: #1f2937 !important; }
         </style>
         """
     else:
@@ -41,12 +46,6 @@ def apply_theme(is_dark):
         <style>
         .stApp { background: linear-gradient(to right, #f8f9fa, #e9ecef); color: #333; }
         section[data-testid="stSidebar"] { background-color: #ffffff; border-right: 1px solid #e0e0e0; }
-        .css-1r6slb0, .stDataFrame, .stForm, div[data-testid="stExpander"] { 
-            background-color: white !important; padding: 1rem; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); 
-        }
-        .stTextInput input, .stNumberInput input, .stDateInput input, .stSelectbox div[data-baseweb="select"] > div {
-            background-color: #ffffff !important; color: #333333 !important;
-        }
         .main-header { font-family: 'Segoe UI', sans-serif; font-size: 1.2rem; font-weight: 700; color: #2c3e50; margin-bottom: 0px; }
         .sub-header { font-size: 0.9rem; color: #7f8c8d; }
         </style>
@@ -54,229 +53,364 @@ def apply_theme(is_dark):
 
 
 # ==============================================================================
-#                           DATABASE FUNCTIONS (ALL SQLITE NOW)
+#                           GOOGLE SHEETS CONNECTION
 # ==============================================================================
+@st.cache_resource
+def get_gsheet_client():
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=SCOPES
+    )
+    return gspread.authorize(creds)
+
+
+def get_db():
+    client = get_gsheet_client()
+    try:
+        sh = client.open(SHEET_NAME)
+        return sh
+    except gspread.exceptions.SpreadsheetNotFound:
+        st.error(f"Spreadsheet '{SHEET_NAME}' not found! Please create it.")
+        st.stop()
+
+
+def get_col_letter(col_idx):
+    col_idx += 1
+    letter = ''
+    while col_idx > 0:
+        col_idx, remainder = divmod(col_idx - 1, 26)
+        letter = chr(65 + remainder) + letter
+    return letter
+
+
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    sh = get_db()
+    # 1. TRADES TAB
+    try:
+        ws_trades = sh.worksheet("Trades")
+    except:
+        ws_trades = sh.add_worksheet(title="Trades", rows="100", cols="20")
+        ws_trades.append_row([
+            "id", "stock_name", "cmp", "entry", "stop_loss", "target",
+            "remark", "trade_type", "dv_analysis", "trade_zone",
+            "trigger_date", "exit_date", "status"
+        ])
+    headers = ws_trades.row_values(1)
+    if "status" not in headers:
+        ws_trades.update_cell(1, len(headers) + 1, "status")
 
-    # Table 1: Swing/Intraday Trades
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            stock_name TEXT, cmp TEXT, entry TEXT, stop_loss TEXT, 
-            target TEXT, remark TEXT, trade_type TEXT, dv_analysis TEXT, 
-            trade_zone TEXT, trigger_date TEXT, exit_date TEXT
-        )
-    ''')
+    # 2. PORTFOLIO TAB
+    try:
+        ws_port = sh.worksheet("Portfolio")
+    except:
+        ws_port = sh.add_worksheet(title="Portfolio", rows="100", cols="10")
+        ws_port.append_row(["stock_name", "date", "stop_loss", "target", "actual_cost"])
 
-    # Table 2: Long Term Portfolio (Replaces Excel)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS portfolio (
-            stock_name TEXT, 
-            date TEXT, 
-            stop_loss REAL, 
-            target REAL, 
-            actual_cost REAL
-        )
-    ''')
-
-    # Migration columns for trades table
-    cursor.execute("PRAGMA table_info(trades)")
-    cols = [c[1] for c in cursor.fetchall()]
-    if "trigger_date" not in cols: cursor.execute("ALTER TABLE trades ADD COLUMN trigger_date TEXT")
-    if "exit_date" not in cols: cursor.execute("ALTER TABLE trades ADD COLUMN exit_date TEXT")
-
-    conn.commit()
-    conn.close()
+    # 3. LINKS TAB
+    try:
+        ws_links = sh.worksheet("Links")
+    except:
+        ws_links = sh.add_worksheet(title="Links", rows="100", cols="5")
+        ws_links.append_row(["stock_name", "link"])
 
 
-# --- TRADES FUNCTIONS ---
-def get_trades(zone=None, trade_type=None, screen="DASHBOARD"):
-    conn = sqlite3.connect(DB_NAME)
-    query = "SELECT * FROM trades WHERE 1=1"
-    params = []
-    if screen == "LIVE":
-        query += " AND trigger_date IS NOT NULL AND trigger_date != '' AND (exit_date IS NULL OR exit_date = '')"
-    elif screen == "PAST":
-        query += " AND trigger_date IS NOT NULL AND trigger_date != '' AND exit_date IS NOT NULL AND exit_date != ''"
+# ==============================================================================
+#                           TRADES LOGIC
+# ==============================================================================
+def get_trades_df():
+    sh = get_db()
+    ws = sh.worksheet("Trades")
+    data = ws.get_all_records()
+    df = pd.DataFrame(data)
 
-    if zone:
-        query += " AND trade_zone = ?"
-        params.append(zone)
-    if trade_type and trade_type != "ANY":
-        query += " AND trade_type = ?"
-        params.append(trade_type)
+    if not df.empty:
+        df['id'] = pd.to_numeric(df['id'], errors='coerce')
+        cols = ['cmp', 'entry', 'stop_loss', 'target']
+        for c in cols:
+            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0.0)
 
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
+        if 'status' not in df.columns:
+            df['status'] = "Pending"
+        else:
+            df['status'] = df['status'].replace(r'^\s*$', 'Pending', regex=True)
+            df['status'] = df['status'].fillna('Pending')
     return df
 
 
-def get_trade_by_id(trade_id):
-    conn = sqlite3.connect(DB_NAME)
-    df = pd.read_sql_query("SELECT * FROM trades WHERE id=?", conn, params=(int(trade_id),))
-    conn.close()
-    return df.iloc[0] if not df.empty else None
+def get_trendlyne_map():
+    sh = get_db()
+    try:
+        ws = sh.worksheet("Links")
+        data = ws.get_all_records()
+        return {str(row['stock_name']).strip().upper(): row['link'] for row in data}
+    except:
+        return {}
+
+
+def get_filtered_trades_advanced(f_status, f_zone, f_strat, f_pct):
+    df = get_trades_df()
+    if df.empty: return df
+
+    # Basic Filtering
+    if f_status != "All":
+        df = df[df['status'] == f_status]
+    if f_zone != "All":
+        df = df[df['trade_zone'] == f_zone]
+    if f_strat != "All":
+        df = df[df['trade_type'] == f_strat]
+
+    if df.empty: return df
+
+    # ALERT CALCULATION LOGIC
+    def calc_alert(row):
+        # PRIORITY 1: Check if Active
+        if row['status'] == 'Active':
+            return 0.0, "Trade is Active"
+
+        # PRIORITY 2: Check Proximity (Percentage)
+        if row['entry'] == 0: return 100, ""
+
+        diff = abs(row['cmp'] - row['entry'])
+        pct = (diff / row['entry']) * 100
+
+        alert_msg = ""
+        if pct <= 0.5:
+            alert_msg = "Within 0.5% Range"
+        elif pct <= 1.0:
+            alert_msg = "Within 1% Range"
+
+        return pct, alert_msg
+
+    df[['diff_pct', 'Alert']] = df.apply(lambda row: pd.Series(calc_alert(row)), axis=1)
+
+    # Filter by % Diff if requested (Note: Active trades have diff_pct=0.0 so they stay)
+    if f_pct != "All":
+        limit = float(f_pct)
+        df = df[df['diff_pct'] <= limit]
+
+    link_map = get_trendlyne_map()
+
+    def match_link(stock_name):
+        clean_name = str(stock_name).replace('.NS', '').replace('.BO', '').strip().upper()
+        return link_map.get(clean_name, None)
+
+    df['Trendlyne'] = df['stock_name'].apply(match_link)
+    return df
+
+
+def get_next_id(df):
+    if df.empty or 'id' not in df.columns: return 1
+    try:
+        return int(pd.to_numeric(df['id'], errors='coerce').max()) + 1
+    except:
+        return 1
 
 
 def add_trade(data):
+    sh = get_db()
+    ws = sh.worksheet("Trades")
+    df = pd.DataFrame(ws.get_all_records())
+    new_id = get_next_id(df)
     clean_stock = data['stock'].replace('.NS', '').replace('.BO', '')
     link = f"https://in.tradingview.com/chart/?symbol=NSE:{clean_stock}"
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute(
-        "INSERT INTO trades (stock_name, cmp, entry, stop_loss, target, remark, trade_type, trade_zone, dv_analysis, trigger_date, exit_date) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (data['stock'], data['cmp'], data['entry'], data['sl'], data['tgt'], data['remark'], data['type'], data['zone'],
-         link, None, None))
-    conn.commit()
-    conn.close()
+    headers = ws.row_values(1)
+    row_data = {
+        "id": new_id, "stock_name": data['stock'], "cmp": data['cmp'],
+        "entry": data['entry'], "stop_loss": data['sl'], "target": data['tgt'],
+        "remark": data['remark'], "trade_type": data['type'],
+        "dv_analysis": link, "trade_zone": data['zone'],
+        "trigger_date": "", "exit_date": "", "status": "Pending"
+    }
+    final_row = []
+    for h in headers:
+        final_row.append(row_data.get(h, ""))
+    ws.append_row(final_row)
 
 
 def update_trade(trade_id, data):
-    clean_stock = data['stock'].replace('.NS', '').replace('.BO', '')
-    link = f"https://in.tradingview.com/chart/?symbol=NSE:{clean_stock}"
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute(
-        "UPDATE trades SET stock_name=?, cmp=?, entry=?, stop_loss=?, target=?, remark=?, trade_type=?, trade_zone=?, dv_analysis=? WHERE id=?",
-        (data['stock'], data['cmp'], data['entry'], data['sl'], data['tgt'], data['remark'], data['type'], data['zone'],
-         link, int(trade_id)))
-    conn.commit()
-    conn.close()
+    sh = get_db()
+    ws = sh.worksheet("Trades")
+    cell = ws.find(str(trade_id), in_column=1)
+    if cell:
+        clean_stock = data['stock'].replace('.NS', '').replace('.BO', '')
+        link = f"https://in.tradingview.com/chart/?symbol=NSE:{clean_stock}"
+        r = cell.row
+        ws.update_cell(r, 2, data['stock'])
+        ws.update_cell(r, 3, data['cmp'])
+        ws.update_cell(r, 4, data['entry'])
+        ws.update_cell(r, 5, data['sl'])
+        ws.update_cell(r, 6, data['tgt'])
+        ws.update_cell(r, 7, data['remark'])
+        ws.update_cell(r, 8, data['type'])
+        ws.update_cell(r, 9, link)
+        ws.update_cell(r, 10, data['zone'])
 
 
 def delete_trade(trade_id):
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("DELETE FROM trades WHERE id=?", (int(trade_id),))
-    conn.commit()
-    conn.close()
+    sh = get_db()
+    ws = sh.worksheet("Trades")
+    cell = ws.find(str(trade_id), in_column=1)
+    if cell: ws.delete_rows(cell.row)
 
 
 def update_prices_logic():
-    conn = sqlite3.connect(DB_NAME)
-    rows = conn.execute(
-        "SELECT id, stock_name, entry, stop_loss, target, trigger_date, exit_date, trade_zone FROM trades").fetchall()
+    sh = get_db()
+    ws = sh.worksheet("Trades")
+    all_values = ws.get_all_values()
+    if not all_values: return 0, 0, 0
+    headers = all_values[0]
+    rows = all_values[1:]
+    try:
+        col_map = {h: i for i, h in enumerate(headers)}
+        idx_stock, idx_cmp = col_map["stock_name"], col_map["cmp"]
+        idx_entry, idx_sl = col_map["entry"], col_map["stop_loss"]
+        idx_tgt, idx_trig = col_map["target"], col_map["trigger_date"]
+        idx_exit, idx_zone, idx_status = col_map["exit_date"], col_map["trade_zone"], col_map["status"]
+    except KeyError:
+        return 0, 0, 0
+    updates = []
     count = 0;
     new_triggers = 0;
     new_exits = 0
-    for rid, name, entry_price, sl_price, tgt_price, trig_date, ex_date, zone in rows:
+
+    def to_float(val):
         try:
+            return float(str(val).replace(',', '').strip())
+        except:
+            return 0.0
+
+    for i, row in enumerate(rows):
+        row_num = i + 2
+        name = row[idx_stock]
+        if not name: continue
+        try:
+            current_status = row[idx_status].strip() if len(row) > idx_status else "Pending"
+            if not current_status: current_status = "Pending"
+            if current_status in ["Target-Hit", "SL-Hit"]: continue
             tkr = name + ".NS" if not name.endswith((".NS", ".BO")) else name
             data = yf.Ticker(tkr).history(period="1d")
             if data.empty: continue
             cmp_val = round(data['Close'].iloc[-1], 2)
-            new_trig = trig_date;
-            new_exit = ex_date
-            c = float(cmp_val);
-            e = float(entry_price) if entry_price else 0.0
-            s = float(sl_price) if sl_price else 0.0;
-            t = float(tgt_price) if tgt_price else 0.0
+            entry = to_float(row[idx_entry])
+            sl, tgt = to_float(row[idx_sl]), to_float(row[idx_tgt])
+            zone = row[idx_zone].strip()
+            new_status, new_trig, new_exit = current_status, row[idx_trig], row[idx_exit]
+            changed = False
 
-            if (not trig_date or trig_date == '') and e > 0:
-                is_initiated = False
-                if zone == "DEMAND" and c <= e:
-                    is_initiated = True
-                elif zone == "SUPPLY" and c >= e:
-                    is_initiated = True
-                if is_initiated: new_trig = datetime.now().strftime("%Y-%m-%d %H:%M"); new_triggers += 1
+            if new_status == "Pending":
+                triggered = False
+                # DEMAND: Trigger if Price drops DOWN to Entry (Buy Dip)
+                if zone == "DEMAND" and cmp_val <= entry and entry > 0:
+                    triggered = True
+                # SUPPLY: Trigger if Price rises UP to Entry (Sell Rally)
+                elif zone == "SUPPLY" and cmp_val >= entry and entry > 0:
+                    triggered = True
+                if triggered:
+                    new_status = "Active"
+                    new_trig = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    new_triggers += 1;
+                    changed = True
 
-            if new_trig and (not ex_date or ex_date == '') and s > 0 and t > 0:
-                is_exited = False
+            elif new_status == "Active":
+                hit = False
                 if zone == "DEMAND":
-                    if c <= s or c >= t: is_exited = True
+                    if cmp_val >= tgt and tgt > 0:
+                        new_status = "Target-Hit"; hit = True
+                    elif cmp_val <= sl and sl > 0:
+                        new_status = "SL-Hit"; hit = True
                 elif zone == "SUPPLY":
-                    if c >= s or c <= t: is_exited = True
-                if is_exited: new_exit = datetime.now().strftime("%Y-%m-%d %H:%M"); new_exits += 1
+                    if cmp_val <= tgt and tgt > 0:
+                        new_status = "Target-Hit"; hit = True
+                    elif cmp_val >= sl and sl > 0:
+                        new_status = "SL-Hit"; hit = True
+                if hit:
+                    new_exit = datetime.now().strftime("%Y-%m-%d %H:%M");
+                    new_exits += 1;
+                    changed = True
 
-            conn.execute("UPDATE trades SET cmp=?, trigger_date=?, exit_date=? WHERE id=?",
-                         (str(cmp_val), new_trig, new_exit, rid))
+            col_cmp_letter = get_col_letter(idx_cmp)
+            updates.append({'range': f'{col_cmp_letter}{row_num}', 'values': [[cmp_val]]})
+            if changed or row[idx_status].strip() == "":
+                updates.append({'range': f'{get_col_letter(idx_status)}{row_num}', 'values': [[new_status]]})
+            if changed:
+                updates.append({'range': f'{get_col_letter(idx_trig)}{row_num}', 'values': [[new_trig]]})
+                updates.append({'range': f'{get_col_letter(idx_exit)}{row_num}', 'values': [[new_exit]]})
             count += 1
-        except:
+        except Exception:
             pass
-    conn.commit()
-    conn.close()
+    if updates: ws.batch_update(updates)
     return count, new_triggers, new_exits
 
 
 def get_stats():
-    conn = sqlite3.connect(DB_NAME)
-    df = pd.read_sql_query("SELECT trade_zone FROM trades", conn)
-    conn.close()
+    df = get_trades_df()
+    if df.empty: return 0, 0, 0
     return len(df), len(df[df['trade_zone'] == 'DEMAND']), len(df[df['trade_zone'] == 'SUPPLY'])
 
 
-# --- NEW PORTFOLIO FUNCTIONS (SQLITE REPLACEMENT FOR EXCEL) ---
-def load_portfolio_data():
-    conn = sqlite3.connect(DB_NAME)
-    try:
-        df = pd.read_sql("SELECT * FROM portfolio", conn)
-        # Rename columns to match UI expectation if needed, or keep SQL names
-        # SQL: stock_name, date, stop_loss, target, actual_cost
-        df.columns = ['Stock Name', 'Date', 'Stop Loss', 'Target', 'Actual Cost']
-    except:
-        df = pd.DataFrame(columns=['Stock Name', 'Date', 'Stop Loss', 'Target', 'Actual Cost'])
-    conn.close()
-    return df
+# ==============================================================================
+#                           PORTFOLIO FUNCTIONS
+# ==============================================================================
+def get_portfolio_df():
+    sh = get_db()
+    ws = sh.worksheet("Portfolio")
+    data = ws.get_all_records()
+    return pd.DataFrame(data)
 
 
-def save_portfolio_data(df):
-    # Rename for SQL compatibility
-    df_sql = df.copy()
-    df_sql.columns = ['stock_name', 'date', 'stop_loss', 'target', 'actual_cost']
-    conn = sqlite3.connect(DB_NAME)
-    # Replace ensures we overwrite the table with current view (mimics Excel save)
-    df_sql.to_sql('portfolio', conn, if_exists='replace', index=False)
-    conn.close()
+def save_portfolio_df(df):
+    sh = get_db()
+    ws = sh.worksheet("Portfolio")
+    ws.clear()
+    data_to_save = [df.columns.values.tolist()] + df.values.tolist()
+    ws.update(range_name='A1', values=data_to_save)
 
 
 def add_portfolio_stock(data):
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("INSERT INTO portfolio (stock_name, date, stop_loss, target, actual_cost) VALUES (?,?,?,?,?)",
-                 (data['name'], data['date'], data['sl'], data['target'], data['cost']))
-    conn.commit()
-    conn.close()
+    sh = get_db()
+    ws = sh.worksheet("Portfolio")
+    ws.append_row([data['name'], data['date'], data['sl'], data['target'], data['cost']])
 
 
 def delete_portfolio_stock(stock_name):
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("DELETE FROM portfolio WHERE stock_name=?", (stock_name,))
-    conn.commit()
-    conn.close()
+    sh = get_db()
+    ws = sh.worksheet("Portfolio")
+    cell = ws.find(stock_name, in_column=1)
+    if cell: ws.delete_rows(cell.row)
 
 
 # ==============================================================================
-#                                   INIT & SIDEBAR
+#                           UI POPUP COMPONENT
+# ==============================================================================
+@st.dialog("🚨 Market Alerts")
+def show_alert_popup(alert_df):
+    st.warning("Updates Detected:")
+
+    # Display simplified table in popup
+    display_df = alert_df[['stock_name', 'Alert', 'trade_type', 'cmp']].reset_index(drop=True)
+    st.dataframe(display_df, use_container_width=True)
+
+    st.write("---")
+    if st.button("OK, Dismiss", type="primary"):
+        st.session_state.show_popup = False
+        st.rerun()
+
+
+# ==============================================================================
+#                                   UI MAIN
 # ==============================================================================
 init_db()
-
 if 'last_refresh' not in st.session_state: st.session_state.last_refresh = time.time()
-if time.time() - st.session_state.last_refresh > 60:
-    update_prices_logic()
-    st.session_state.last_refresh = time.time()
-    st.rerun()
 
 with st.sidebar:
     st.markdown("### 🧭 Navigation")
-    nav_option = st.radio("", ["Dashboard", "Live Trades", "Past Trades", "Portfolio Watch"],
+    nav_option = st.radio("Main Navigation", ["Dashboard", "Live Trades", "Past Trades", "Portfolio Watch"],
                           label_visibility="collapsed")
     st.markdown("---")
-
-    # THEME TOGGLE
     is_dark = st.toggle("🌙 Dark Mode", value=False)
     st.markdown(apply_theme(is_dark), unsafe_allow_html=True)
     st.markdown("---")
 
-    if nav_option in ["Dashboard", "Live Trades", "Past Trades"]:
-        st.markdown("### 🌪 Filters")
-        c1, c2 = st.columns(2)
-        with c1:
-            filter_zone = st.radio("Zone", ["DEMAND", "SUPPLY"])
-        with c2:
-            filter_type = st.selectbox("Strategy", ["ANY", "QIT", "MIT", "WIT", "DIT"])
-        st.markdown("---")
-        tot, dem, sup = get_stats()
-        st.markdown(f"**Total:** {tot} | **Buy:** {dem} | **Sell:** {sup}")
-
-    elif nav_option == "Portfolio Watch":
+    if nav_option == "Portfolio Watch":
         st.header("➕ Add New Stock")
         with st.form("add_stock_form"):
             name = st.text_input("Stock Name")
@@ -285,209 +419,176 @@ with st.sidebar:
             target = st.number_input("Target", value=0.0)
             cost = st.number_input("Actual Cost", value=0.0)
             if st.form_submit_button("Add to Portfolio"):
-                add_portfolio_stock(
-                    {'name': name, 'date': date.strftime('%Y-%m-%d'), 'sl': sl, 'target': target, 'cost': cost})
+                add_portfolio_stock({'name': name, 'date': str(date), 'sl': sl, 'target': target, 'cost': cost})
                 st.success("Stock Added!")
                 st.rerun()
 
-# ==============================================================================
-#                           HEADER
-# ==============================================================================
+# --- HEADER ---
 col_h1, col_h2 = st.columns([6, 2])
 with col_h1:
-    sub_text = "Shared Portfolio Manager (Database)" if nav_option == "Portfolio Watch" else f"Viewing <b>{filter_zone}</b> trades | Strategy: <b>{filter_type}</b>"
+    sub_text = "Shared Cloud Database" if nav_option == "Portfolio Watch" else f"Viewing <b>{nav_option}</b>"
     st.markdown(f"""<div class='main-header'>📈 {nav_option}</div><div class='sub-header'>{sub_text}</div>""",
                 unsafe_allow_html=True)
 
 with col_h2:
     if nav_option != "Portfolio Watch":
-        c_refresh, c_timer = st.columns([1, 1])
-        with c_refresh:
-            if st.button("↻ Update"):
+        if st.button("↻ Cloud Update"):
+            with st.spinner("Updating Prices & Status..."):
                 c, trig, ex = update_prices_logic()
-                st.toast(f"Updated {c}. {trig} Initiated, {ex} Closed.")
-                st.session_state.last_refresh = time.time()
-                time.sleep(1)
-                st.rerun()
-        with c_timer:
-            time_left = 60 - int(time.time() - st.session_state.last_refresh)
-            st.markdown(
-                f"<div style='font-size:12px; color:{'#a0a0a0' if is_dark else 'gray'}; text-align:center; padding-top:5px;'>Auto: <b>{max(0, time_left)}s</b></div>",
-                unsafe_allow_html=True)
+            st.toast(f"Checked {c} stocks. {trig} Activated, {ex} Closed.")
+            st.session_state.last_refresh = time.time()
+            time.sleep(1)
+            st.rerun()
 
+# --- ROUTER ---
+if nav_option == "Dashboard":
 
-# ==============================================================================
-#                           VIEW FUNCTIONS
-# ==============================================================================
-
-def render_dashboard():
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("📊 Total Trades", tot)
-    m2.metric("🟢 Demand (Buy)", dem)
-    m3.metric("🔴 Supply (Sell)", sup)
-    m4.metric("⚡ Strategy", filter_type)
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        f_status = st.selectbox("Status", ["All", "Pending", "Active", "Target-Hit", "SL-Hit"], index=0)
+    with f2:
+        f_zone = st.selectbox("Zone", ["All", "DEMAND", "SUPPLY"], index=0)
+    with f3:
+        f_strat = st.selectbox("Strategy", ["All", "QIT", "MIT", "WIT", "DIT"], index=0)
+    with f4:
+        f_pct = st.selectbox("% CMP Diff", ["All", "0.5", "1", "1.5", "2"], index=0)
     st.markdown("---")
 
-    c_exp1, c_exp2 = st.columns(2)
-    with c_exp1:
-        with st.expander("➕ Add New Trade", expanded=False):
+    c1, c2 = st.columns(2)
+    with c1:
+        with st.expander("➕ Add Trade"):
             with st.form("add_form", clear_on_submit=True):
-                c1, c2 = st.columns(2)
-                f_zone = c1.selectbox("Zone", ["DEMAND", "SUPPLY"])
-                f_type = c2.selectbox("Type", ["QIT", "MIT", "WIT", "DIT"])
-                f_stock = st.text_input("Stock Name")
+                fz = st.selectbox("Zone", ["DEMAND", "SUPPLY"])
+                ft = st.selectbox("Type", ["QIT", "MIT", "WIT", "DIT"])
+                fst = st.text_input("Stock")
                 r1, r2, r3 = st.columns(3)
-                f_entry, f_sl, f_tgt = r1.text_input("Entry"), r2.text_input("SL"), r3.text_input("Target")
-                f_cmp, f_remark = st.text_input("CMP (Optional)"), st.text_input("Remark")
-                if st.form_submit_button("Save Trade", use_container_width=True) and f_stock:
-                    add_trade({"stock": f_stock.upper(), "cmp": f_cmp, "entry": f_entry, "sl": f_sl, "tgt": f_tgt,
-                               "remark": f_remark, "type": f_type, "zone": f_zone})
-                    st.success("Saved!")
+                fe, fs, ftg = r1.text_input("Entry"), r2.text_input("SL"), r3.text_input("Target")
+                fc, fr = st.text_input("CMP"), st.text_input("Remark")
+                if st.form_submit_button("Save") and fst:
+                    add_trade(
+                        {"stock": fst.upper(), "cmp": fc, "entry": fe, "sl": fs, "tgt": ftg, "remark": fr, "type": ft,
+                         "zone": fz})
+                    with st.spinner("Processing..."): update_prices_logic()
+                    st.success("Added!");
                     st.rerun()
 
-    with c_exp2:
-        with st.expander("✏️ Edit Trade", expanded=False):
-            c_search, c_btn = st.columns([3, 1])
-            edit_id = c_search.number_input("Trade ID", min_value=1, step=1, label_visibility="collapsed")
-            if 'edit_data' not in st.session_state: st.session_state.edit_data = None
-            if c_btn.button("Load"):
-                t = get_trade_by_id(edit_id)
-                if t is not None:
-                    st.session_state.edit_data = t
+    with c2:
+        with st.expander("✏️ Edit Trade"):
+            eid = st.number_input("ID", min_value=1, step=1)
+            if st.button("Load"):
+                df_all = get_trades_df()
+                res = df_all[df_all['id'] == eid]
+                if not res.empty:
+                    st.session_state.edit_data = res.iloc[0]
                 else:
-                    st.error("Invalid ID")
-
+                    st.error("Not Found")
             if st.session_state.edit_data is not None:
                 t = st.session_state.edit_data
-                with st.form(key=f"edit_form_{t['id']}"):
-                    st.caption(f"Editing: {t['stock_name']}")
-                    e1, e2 = st.columns(2)
-                    e_zone = e1.selectbox("Zone", ["DEMAND", "SUPPLY"], index=0 if t['trade_zone'] == "DEMAND" else 1,
-                                          key=f"e_zone_{t['id']}")
-                    e_type = e2.selectbox("Type", ["QIT", "MIT", "WIT", "DIT"],
-                                          index=["QIT", "MIT", "WIT", "DIT"].index(t['trade_type']),
-                                          key=f"e_type_{t['id']}")
-                    e_stock = st.text_input("Stock", value=t['stock_name'], key=f"e_stock_{t['id']}")
+                with st.form("edit"):
+                    st.caption(f"Edit: {t['stock_name']}")
+                    ez = st.selectbox("Zone", ["DEMAND", "SUPPLY"], index=0 if t['trade_zone'] == "DEMAND" else 1)
+                    et = st.selectbox("Type", ["QIT", "MIT", "WIT", "DIT"],
+                                      index=["QIT", "MIT", "WIT", "DIT"].index(t['trade_type']))
+                    est = st.text_input("Stock", t['stock_name'])
                     er1, er2, er3 = st.columns(3)
-                    e_entry = er1.text_input("Entry", value=t['entry'], key=f"e_ent_{t['id']}")
-                    e_sl = er2.text_input("SL", value=t['stop_loss'], key=f"e_sl_{t['id']}")
-                    e_tgt = er3.text_input("Target", value=t['target'], key=f"e_tgt_{t['id']}")
-                    e_cmp = st.text_input("CMP", value=t['cmp'], key=f"e_cmp_{t['id']}")
-                    e_remark = st.text_input("Remark", value=t['remark'], key=f"e_rem_{t['id']}")
-                    if st.form_submit_button("Update", use_container_width=True):
-                        update_trade(t['id'], {"stock": e_stock.upper(), "cmp": e_cmp, "entry": e_entry, "sl": e_sl,
-                                               "tgt": e_tgt, "remark": e_remark, "type": e_type, "zone": e_zone})
-                        st.success("Updated!")
-                        st.session_state.edit_data = None
-                        time.sleep(1)
+                    ee, es, etg = er1.text_input("Entry", t['entry']), er2.text_input("SL",
+                                                                                      t['stop_loss']), er3.text_input(
+                        "Target", t['target'])
+                    ec, er = st.text_input("CMP", t['cmp']), st.text_input("Remark", t['remark'])
+                    if st.form_submit_button("Update"):
+                        update_trade(t['id'], {"stock": est, "cmp": ec, "entry": ee, "sl": es, "tgt": etg, "remark": er,
+                                               "type": et, "zone": ez})
+                        st.session_state.edit_data = None;
+                        update_prices_logic();
+                        st.success("Updated!");
                         st.rerun()
 
-    df = get_trades(filter_zone, filter_type, "DASHBOARD")
-    for col in ['trigger_date', 'exit_date']:
-        if col in df.columns: df[col] = df[col].fillna("").astype(str).replace(['None', 'nan'], '')
-    if not df.empty:
-        st.data_editor(df[['id', 'trade_zone', 'stock_name', 'cmp', 'entry', 'stop_loss', 'target', 'trigger_date',
-                           'exit_date', 'dv_analysis']],
-                       column_config={"dv_analysis": st.column_config.LinkColumn("Chart", display_text="View"),
-                                      "trigger_date": st.column_config.TextColumn("Order Initiate"),
-                                      "exit_date": st.column_config.TextColumn("SL/TGT Date"), "trade_zone": "Zone",
-                                      "stock_name": "Stock",
-                                      "cmp": st.column_config.NumberColumn("CMP", format="%.2f")},
-                       hide_index=True, use_container_width=True, height=500, key="dash_table")
-        with st.expander("🗑 Delete Trade"):
-            cd1, cd2 = st.columns([1, 4])
-            d_id = cd1.number_input("ID", min_value=0, label_visibility="collapsed")
-            if cd2.button("Delete"): delete_trade(d_id); st.rerun()
-    else:
-        st.info("No active trades.")
-
-
-def render_live():
-    df = get_trades(filter_zone, filter_type, "LIVE")
-    if 'trigger_date' in df.columns: df['trigger_date'] = df['trigger_date'].fillna("").astype(str)
-    if not df.empty:
-        st.data_editor(df[['id', 'trade_zone', 'stock_name', 'cmp', 'entry', 'stop_loss', 'target', 'trigger_date',
-                           'dv_analysis']],
-                       column_config={"dv_analysis": st.column_config.LinkColumn("Chart", display_text="View"),
-                                      "trigger_date": st.column_config.TextColumn("Order Initiate Date"),
-                                      "trade_zone": "Zone", "stock_name": "Stock",
-                                      "cmp": st.column_config.NumberColumn("CMP", format="%.2f")},
-                       hide_index=True, use_container_width=True, height=600, key="live_table")
-    else:
-        st.success("No live triggered trades at the moment.")
-
-
-def render_past():
-    df = get_trades(filter_zone, filter_type, "PAST")
-    if 'exit_date' in df.columns: df['exit_date'] = df['exit_date'].fillna("").astype(str)
-
-    def check_status(row):
-        try:
-            c, s, t = float(row['cmp']), float(row['stop_loss']), float(row['target'])
-            if row['trade_zone'] == "DEMAND":
-                return "❌ SL Hit" if c <= s else ("🎯 Target Hit" if c >= t else None)
-            else:
-                return "❌ SL Hit" if c >= s else ("🎯 Target Hit" if c <= t else None)
-        except:
-            return None
+    df = get_filtered_trades_advanced(f_status, f_zone, f_strat, f_pct)
 
     if not df.empty:
-        df['STATUS'] = df.apply(check_status, axis=1)
-        st.data_editor(
-            df[['id', 'trade_zone', 'stock_name', 'cmp', 'stop_loss', 'target', 'exit_date', 'STATUS', 'dv_analysis']],
-            column_config={"dv_analysis": st.column_config.LinkColumn("Chart", display_text="View"),
-                           "exit_date": st.column_config.TextColumn("SL/TGT Date"), "trade_zone": "Zone",
-                           "stock_name": "Stock", "cmp": st.column_config.NumberColumn("CMP", format="%.2f")},
-            hide_index=True, use_container_width=True, height=600, key="past_table")
+        # --- POPUP LOGIC ---
+        current_alerts = df[df['Alert'] != ""]
+        new_popup_alerts = []
+
+        for idx, row in current_alerts.iterrows():
+            s_name = row['stock_name']
+            curr_alert_msg = row['Alert']
+            prev_msg = st.session_state.previous_alerts.get(s_name, "")
+
+            # TRIGGER IF ALERT TEXT CHANGES (Includes switch from 'Within 0.5%' -> 'Trade is Active')
+            if curr_alert_msg != prev_msg:
+                new_popup_alerts.append(row)
+                st.session_state.previous_alerts[s_name] = curr_alert_msg
+
+        # Cleanup old alerts
+        current_stock_names = set(current_alerts['stock_name'])
+        for s_name in list(st.session_state.previous_alerts.keys()):
+            if s_name not in current_stock_names:
+                st.session_state.previous_alerts[s_name] = ""
+
+        if new_popup_alerts:
+            st.session_state.popup_data = pd.DataFrame(new_popup_alerts)
+            st.session_state.show_popup = True
+
+        if st.session_state.show_popup and not st.session_state.popup_data.empty:
+            show_alert_popup(st.session_state.popup_data)
+
+
+        def highlight_alerts(row):
+            styles = [''] * len(row)
+            if row['Alert'] == "Trade is Active":
+                return ['background-color: #4caf50; color: white; font-weight: bold'] * len(row)  # Green for Active
+            elif row['Alert'] == "Within 0.5% Range":
+                return ['background-color: #ffeb3b; color: black'] * len(row)
+            elif row['Alert'] == "Within 1% Range":
+                return ['background-color: #90caf9; color: black'] * len(row)
+            return styles
+
+
+        st.dataframe(
+            df[['id', 'Alert', 'trade_type', 'status', 'stock_name', 'trade_zone', 'cmp', 'entry', 'stop_loss',
+                'target', 'dv_analysis', 'Trendlyne']]
+            .style.apply(highlight_alerts, axis=1),
+            column_config={
+                "dv_analysis": st.column_config.LinkColumn("View Chart", display_text="TradingView"),
+                "Trendlyne": st.column_config.LinkColumn("Fundls", display_text="Trendlyne"),
+                "cmp": st.column_config.NumberColumn(format="%.2f"),
+                "entry": st.column_config.NumberColumn(format="%.2f")
+            },
+            use_container_width=True, hide_index=True
+        )
+
+        with st.expander("🗑 Delete"):
+            did = st.number_input("Del ID", min_value=0)
+            if st.button("Delete Trade"): delete_trade(did); st.rerun()
     else:
-        st.info("No past trades found.")
+        st.info("No trades match your filters.")
 
-
-def render_portfolio():
-    df_port = load_portfolio_data()
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        filter_on = st.toggle("Filter: Cost between SL and Target")
-
-    display_df = df_port.copy()
-
-    def get_status(row):
-        try:
-            return "In Range" if row['Stop Loss'] <= row['Actual Cost'] <= row['Target'] else "Out of Range"
-        except:
-            return "Error"
-
-    display_df['Status'] = display_df.apply(get_status, axis=1)
-    if filter_on: display_df = display_df[display_df['Status'] == "In Range"]
-
-    st.write("💡 *Tip: You can edit values directly in the table below.*")
-    edited_df = st.data_editor(display_df, num_rows="dynamic", use_container_width=True, key="data_editor")
-
-    if not filter_on:
-        if not edited_df.equals(df_port):
-            save_portfolio_data(edited_df)
-            st.toast("Changes saved automatically!", icon="💾")
-    else:
-        st.info("Turn off filter to edit data.")
-
-    with st.expander("🗑️ Delete Stock"):
-        opts = df_port['Stock Name'].tolist()
-        if opts:
-            s_del = st.selectbox("Select Stock", opts)
-            if st.button("Delete"): delete_portfolio_stock(s_del); st.rerun()
-
-
-# ==============================================================================
-#                                MAIN ROUTER
-# ==============================================================================
-if nav_option == "Dashboard":
-    render_dashboard()
 elif nav_option == "Live Trades":
-    render_live()
-elif nav_option == "Past Trades":
-    render_past()
-elif nav_option == "Portfolio Watch":
-    render_portfolio()
+    df_live = get_trades_df()
+    df_live = df_live[df_live['status'] == 'Active']
+    if not df_live.empty:
+        st.dataframe(df_live[['id', 'status', 'stock_name', 'cmp', 'entry', 'stop_loss', 'target', 'dv_analysis']],
+                     use_container_width=True, hide_index=True)
+    else:
+        st.success("No Active trades.")
 
-time.sleep(1)
-st.rerun()
+elif nav_option == "Past Trades":
+    df_past = get_trades_df()
+    df_past = df_past[df_past['status'].isin(['Target-Hit', 'SL-Hit'])]
+    if not df_past.empty:
+        st.dataframe(df_past[['id', 'status', 'stock_name', 'cmp', 'stop_loss', 'target', 'exit_date']],
+                     use_container_width=True, hide_index=True)
+    else:
+        st.info("No History.")
+
+elif nav_option == "Portfolio Watch":
+    df_port = get_portfolio_df()
+    edited_df = st.data_editor(df_port, num_rows="dynamic", use_container_width=True)
+    if not edited_df.equals(df_port):
+        save_portfolio_df(edited_df)
+        st.toast("Saved!")
+    with st.expander("Delete Stock"):
+        if not df_port.empty:
+            ds = st.selectbox("Stock", df_port['stock_name'].tolist())
+            if st.button("Delete"): delete_portfolio_stock(ds); st.rerun()
